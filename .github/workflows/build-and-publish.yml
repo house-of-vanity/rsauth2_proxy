@@ -1,0 +1,58 @@
+name: Build and Publish
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*.*.*'
+
+env:
+  IMAGE_NAME: ultradesu/rsauth2-proxy
+
+jobs:
+  build_docker:
+    name: Build and Publish Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "cargo_version=${VERSION}" >> $GITHUB_OUTPUT
+
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            echo "docker_tags=${IMAGE_NAME}:${TAG_NAME},${IMAGE_NAME}:${VERSION},${IMAGE_NAME}:latest" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/heads/* ]]; then
+            BRANCH=${GITHUB_REF#refs/heads/}
+            echo "docker_tags=${IMAGE_NAME}:${BRANCH},${IMAGE_NAME}:${VERSION},${IMAGE_NAME}:$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          else
+            echo "docker_tags=${IMAGE_NAME}:$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.docker_tags }}
+          cache-from: type=registry,ref=${{ IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ IMAGE_NAME }}:buildcache,mode=max

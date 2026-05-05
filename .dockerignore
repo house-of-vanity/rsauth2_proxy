@@ -1,0 +1,4 @@
+target/
+.git/
+AUTH_PROXY_SPEC.md
+routes.yaml
