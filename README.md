@@ -1,6 +1,6 @@
 # rsauth2-proxy
 
-Auth proxy for [Traefik ForwardAuth](https://doc.traefik.io/traefik/middlewares/http/forwardauth/) with Keycloak OIDC. Single instance protects all services in a cluster. Replaces oauth2-proxy.
+Auth proxy for [Traefik ForwardAuth](https://doc.traefik.io/traefik/middlewares/http/forwardauth/) with Keycloak OIDC. Single instance protects all services in a Kubernetes cluster. Replaces oauth2-proxy.
 
 ## How it works
 
