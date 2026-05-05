@@ -120,15 +120,53 @@ async fn auth_inner(state: &AppState, headers: &HeaderMap) -> Response {
 
 #[derive(Deserialize)]
 pub struct CallbackParams {
-    pub code: String,
-    pub state: String,
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
+    pub error_description: Option<String>,
 }
 
 pub async fn callback(
     State(state): State<Arc<AppState>>,
     Query(params): Query<CallbackParams>,
 ) -> Response {
-    let auth_state = match decrypt_state::<AuthStatePayload>(&state.crypto, &params.state) {
+    // Handle OIDC error responses (e.g. authentication_expired, access_denied)
+    if let Some(error) = &params.error {
+        let desc = params.error_description.as_deref().unwrap_or("");
+        tracing::warn!(error, description = desc, "OIDC provider returned error");
+        metrics::counter!("callback_requests_total", "result" => "error").increment(1);
+
+        // If we have state, try to redirect back to the original URL to retry
+        if let Some(state_str) = &params.state {
+            if let Ok(auth_state) = decrypt_state::<AuthStatePayload>(&state.crypto, state_str) {
+                return redirect_to_login(&state, &auth_state.original_url);
+            }
+        }
+
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("Authentication failed: {} {}", error, desc),
+        )
+            .into_response();
+    }
+
+    let code = match &params.code {
+        Some(c) => c.as_str(),
+        None => {
+            metrics::counter!("callback_requests_total", "result" => "error").increment(1);
+            return (StatusCode::BAD_REQUEST, "missing code parameter").into_response();
+        }
+    };
+
+    let state_str = match &params.state {
+        Some(s) => s.as_str(),
+        None => {
+            metrics::counter!("callback_requests_total", "result" => "error").increment(1);
+            return (StatusCode::BAD_REQUEST, "missing state parameter").into_response();
+        }
+    };
+
+    let auth_state = match decrypt_state::<AuthStatePayload>(&state.crypto, state_str) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "invalid callback state");
@@ -139,7 +177,7 @@ pub async fn callback(
 
     let token_response = match state
         .oidc
-        .exchange_code(&params.code, &auth_state.pkce_verifier)
+        .exchange_code(code, &auth_state.pkce_verifier)
         .await
     {
         Ok(t) => t,
@@ -354,7 +392,7 @@ async fn authorize_request(state: &AppState, session: &Session, host: &str) -> R
         Some(r) => r,
         None => {
             tracing::debug!(host, "host not found in routes, denying");
-            return StatusCode::FORBIDDEN.into_response();
+            return forbidden_page(host, &session.username, "This service is not registered.");
         }
     };
 
@@ -369,7 +407,14 @@ async fn authorize_request(state: &AppState, session: &Session, host: &str) -> R
                 user = session.username,
                 "user not in allowed groups"
             );
-            return StatusCode::FORBIDDEN.into_response();
+            return forbidden_page(
+                host,
+                &session.username,
+                &format!(
+                    "You need to be a member of one of these groups: {}",
+                    route.allowed_groups.join(", ")
+                ),
+            );
         }
     }
 
@@ -382,6 +427,92 @@ async fn authorize_request(state: &AppState, session: &Session, host: &str) -> R
             ("X-Auth-Request-Email", session.email.as_str()),
             ("X-Auth-Request-Groups", groups_csv.as_str()),
         ],
+    )
+        .into_response()
+}
+
+fn forbidden_page(host: &str, username: &str, reason: &str) -> Response {
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>403 - Access Denied</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+    background: #0f0f0f;
+    color: #e0e0e0;
+  }}
+  .box {{
+    text-align: center;
+    padding: 3rem 2rem;
+    max-width: 480px;
+  }}
+  .lock {{
+    font-size: 5rem;
+    line-height: 1;
+    margin-bottom: 1rem;
+  }}
+  h1 {{
+    font-size: 1.8rem;
+    color: #ff6b6b;
+    margin-bottom: 0.5rem;
+  }}
+  .host {{
+    font-size: 0.95rem;
+    color: #888;
+    margin-bottom: 1.5rem;
+    word-break: break-all;
+  }}
+  .reason {{
+    font-size: 1rem;
+    color: #aaa;
+    margin-bottom: 2rem;
+    line-height: 1.5;
+  }}
+  .user {{
+    display: inline-block;
+    background: #1a1a2e;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 0.4rem 0.8rem;
+    font-size: 0.85rem;
+    color: #7c7cf0;
+  }}
+  .hint {{
+    margin-top: 1.5rem;
+    font-size: 0.8rem;
+    color: #555;
+  }}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="lock">&#x1f6ab;</div>
+  <h1>Access Denied</h1>
+  <div class="host">{host}</div>
+  <div class="reason">{reason}</div>
+  <div class="user">Logged in as <strong>{username}</strong></div>
+  <div class="hint">Contact your administrator if you think this is a mistake.</div>
+</div>
+</body>
+</html>"#,
+        host = host,
+        reason = reason,
+        username = username,
+    );
+
+    (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
     )
         .into_response()
 }
