@@ -107,7 +107,7 @@ spec:
     spec:
       containers:
         - name: auth-proxy
-          image: ghcr.io/your-org/rsauth2-proxy:latest
+          image: ultradesu/rsauth2-proxy:0.1.0
           ports:
             - containerPort: 8080
           envFrom:
@@ -197,8 +197,6 @@ cargo build --release
 docker build -t rsauth2-proxy .
 ```
 
-Produces a static musl binary in a `FROM scratch` image (~10MB).
-
 ## Security properties
 
 - **Encrypted cookies** — AES-256-GCM, not just signed. Cookie contents cannot be read or tampered with without the key.
@@ -221,4 +219,4 @@ On successful authentication, the following headers are set on the request forwa
 
 ## License
 
-MIT
+WTFPL
