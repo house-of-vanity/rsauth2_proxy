@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "rsauth2-proxy"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "anyhow",

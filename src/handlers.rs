@@ -1,15 +1,23 @@
 use crate::crypto::CookieCrypto;
-use crate::oidc::OidcClient;
+use crate::oidc::{ClientCredentialsError, OidcClient};
 use crate::routes::SharedRoutes;
 use crate::session::{now_timestamp, Session};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::RwLock;
 
 pub struct AppState {
     pub config: crate::config::Config,
@@ -17,6 +25,7 @@ pub struct AppState {
     pub routes: SharedRoutes,
     pub crypto: CookieCrypto,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    pub machine_cache: RwLock<HashMap<[u8; 32], Instant>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -69,7 +78,10 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> Response {
     let body = state.metrics_handle.render();
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         body,
     )
         .into_response()
@@ -103,6 +115,22 @@ async fn auth_inner(state: &AppState, headers: &HeaderMap) -> Response {
     let uri = uri.unwrap_or("/");
     let original_url = format!("{}://{}{}", proto, host, uri);
 
+    let (browser_access, machine_access) = state
+        .routes
+        .read()
+        .await
+        .get(host)
+        .map(|route| (Some(route.browser_access), route.machine_access.is_some()))
+        .unwrap_or((None, false));
+    if machine_access {
+        if let Some(authorization) = headers.get(header::AUTHORIZATION) {
+            return authorize_machine(state, headers, host, uri, authorization).await;
+        }
+    }
+    if browser_access == Some(false) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     let session = extract_session_from_headers(headers, &state.crypto);
 
     match session {
@@ -113,6 +141,88 @@ async fn auth_inner(state: &AppState, headers: &HeaderMap) -> Response {
             redirect_to_refresh(state, &original_url)
         }
         _ => redirect_to_login(state, &original_url),
+    }
+}
+
+async fn authorize_machine(
+    state: &AppState,
+    headers: &HeaderMap,
+    host: &str,
+    uri: &str,
+    authorization: &axum::http::HeaderValue,
+) -> Response {
+    let Some(encoded) = authorization
+        .to_str()
+        .ok()
+        .and_then(|s| s.strip_prefix("Basic "))
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some((client_id, client_secret)) = STANDARD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|credentials| {
+            credentials
+                .split_once(':')
+                .map(|(id, secret)| (id.to_owned(), secret.to_owned()))
+        })
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if client_id.is_empty() || client_secret.is_empty() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let method = get_header(headers, "x-forwarded-method").unwrap_or("");
+    let path = uri.split('?').next().unwrap_or("");
+    let allowed = state
+        .routes
+        .read()
+        .await
+        .get(host)
+        .and_then(|route| route.machine_access.as_ref())
+        .is_some_and(|machine| {
+            machine.client_ids.iter().any(|id| id == &client_id)
+                && machine.method == method
+                && machine.path == path
+        });
+    if !allowed {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let cache_key: [u8; 32] = Sha256::digest(authorization.as_bytes()).into();
+    if state
+        .machine_cache
+        .read()
+        .await
+        .get(&cache_key)
+        .is_some_and(|expiry| *expiry > Instant::now())
+    {
+        return StatusCode::OK.into_response();
+    }
+
+    match state
+        .oidc
+        .check_client_credentials(&client_id, &client_secret)
+        .await
+    {
+        Ok(expires_in) => {
+            // Never cache longer than Keycloak's token lifetime; keep revocation
+            // delay bounded even when the client has a long token lifetime.
+            let ttl = expires_in.saturating_sub(30).min(300);
+            let mut cache = state.machine_cache.write().await;
+            cache.retain(|_, expiry| *expiry > Instant::now());
+            if ttl > 0 {
+                cache.insert(cache_key, Instant::now() + Duration::from_secs(ttl));
+            }
+            StatusCode::OK.into_response()
+        }
+        Err(ClientCredentialsError::Invalid) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(ClientCredentialsError::Unavailable(error)) => {
+            tracing::warn!(error = %error, "Keycloak client credentials check unavailable");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 
@@ -402,11 +512,7 @@ async fn authorize_request(state: &AppState, session: &Session, host: &str) -> R
             .iter()
             .any(|g| route.allowed_groups.contains(g));
         if !has_access {
-            tracing::debug!(
-                host,
-                user = session.username,
-                "user not in allowed groups"
-            );
+            tracing::debug!(host, user = session.username, "user not in allowed groups");
             return forbidden_page(
                 host,
                 &session.username,
@@ -536,7 +642,9 @@ fn redirect_to_login(state: &AppState, original_url: &str) -> Response {
         }
     };
 
-    let auth_url = state.oidc.auth_url(&encrypted_state, &pkce_challenge, &nonce);
+    let auth_url = state
+        .oidc
+        .auth_url(&encrypted_state, &pkce_challenge, &nonce);
 
     (StatusCode::FOUND, [(header::LOCATION, auth_url)]).into_response()
 }
@@ -554,8 +662,8 @@ fn redirect_to_refresh(state: &AppState, original_url: &str) -> Response {
         }
     };
 
-    let mut url = url::Url::parse(&format!("{}/refresh", state.config.base_url()))
-        .expect("valid base_url");
+    let mut url =
+        url::Url::parse(&format!("{}/refresh", state.config.base_url())).expect("valid base_url");
     url.query_pairs_mut().append_pair("state", &encrypted);
 
     (StatusCode::FOUND, [(header::LOCATION, url.to_string())]).into_response()
@@ -600,15 +708,15 @@ fn format_set_cookie(domain: &str, value: &str, max_age_secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::crypto::CookieCrypto;
+    use crate::oidc::OidcClient;
+    use crate::routes::{MachineAccess, RouteConfig};
+    use crate::session::{now_timestamp, Session};
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::{get, post};
     use axum::Router;
-    use crate::config::Config;
-    use crate::crypto::CookieCrypto;
-    use crate::oidc::OidcClient;
-    use crate::routes::RouteConfig;
-    use crate::session::{now_timestamp, Session};
     use std::collections::HashMap;
     use tokio::sync::RwLock;
     use tower::ServiceExt;
@@ -640,8 +748,7 @@ mod tests {
         let pem = private_key
             .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
             .unwrap();
-        let encoding_key =
-            jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+        let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
 
         TestKeys {
             encoding_key,
@@ -674,9 +781,7 @@ mod tests {
         }))
     }
 
-    async fn mock_jwks(
-        State(st): State<Arc<MockKeycloakState>>,
-    ) -> axum::Json<serde_json::Value> {
+    async fn mock_jwks(State(st): State<Arc<MockKeycloakState>>) -> axum::Json<serde_json::Value> {
         axum::Json(serde_json::json!({
             "keys": [{
                 "kid": st.kid,
@@ -688,9 +793,13 @@ mod tests {
         }))
     }
 
-    async fn mock_token(
-        State(st): State<Arc<MockKeycloakState>>,
-    ) -> axum::Json<serde_json::Value> {
+    async fn mock_token(State(st): State<Arc<MockKeycloakState>>, headers: HeaderMap) -> Response {
+        if let Some(value) = headers.get(header::AUTHORIZATION) {
+            let expected = format!("Basic {}", STANDARD.encode("vector:test-machine-secret"));
+            if value.to_str().ok() != Some(expected.as_str()) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+        }
         let now = now_timestamp();
         let claims = serde_json::json!({
             "iss": st.issuer,
@@ -709,8 +818,7 @@ mod tests {
             kid: Some(st.kid.clone()),
             ..Default::default()
         };
-        let id_token =
-            jsonwebtoken::encode(&header, &claims, &st.encoding_key).unwrap();
+        let id_token = jsonwebtoken::encode(&header, &claims, &st.encoding_key).unwrap();
 
         axum::Json(serde_json::json!({
             "id_token": id_token,
@@ -720,12 +828,11 @@ mod tests {
             "expires_in": 3600,
             "refresh_expires_in": 86400,
         }))
+        .into_response()
     }
 
     async fn start_mock_keycloak(keys: &TestKeys) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let issuer = format!("http://{}", listener.local_addr().unwrap());
 
         let mock_state = Arc::new(MockKeycloakState {
@@ -781,12 +888,28 @@ mod tests {
             "grafana.example.com".into(),
             RouteConfig {
                 allowed_groups: vec!["admins".into(), "developers".into()],
+                browser_access: true,
+                machine_access: None,
             },
         );
         routes.insert(
             "wiki.example.com".into(),
             RouteConfig {
                 allowed_groups: vec![],
+                browser_access: true,
+                machine_access: None,
+            },
+        );
+        routes.insert(
+            "loki.example.com".into(),
+            RouteConfig {
+                allowed_groups: vec![],
+                browser_access: false,
+                machine_access: Some(MachineAccess {
+                    client_ids: vec!["vector".into()],
+                    method: "POST".into(),
+                    path: "/loki/api/v1/push".into(),
+                }),
             },
         );
 
@@ -805,6 +928,7 @@ mod tests {
             routes: Arc::new(RwLock::new(routes)),
             crypto: CookieCrypto::new(&TEST_KEY),
             metrics_handle,
+            machine_cache: RwLock::new(HashMap::new()),
         });
 
         let app = Router::new()
@@ -903,7 +1027,12 @@ mod tests {
     async fn health_returns_200() {
         let (app, _) = setup().await;
         let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -927,7 +1056,10 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::FOUND);
         let location = resp.headers().get("location").unwrap().to_str().unwrap();
-        assert!(location.contains("/authorize"), "should redirect to OIDC authorize");
+        assert!(
+            location.contains("/authorize"),
+            "should redirect to OIDC authorize"
+        );
         assert!(location.contains("client_id=test-client"));
         assert!(location.contains("code_challenge="));
         assert!(location.contains("code_challenge_method=S256"));
@@ -1104,15 +1236,105 @@ mod tests {
     async fn auth_missing_forwarded_host_returns_400() {
         let (app, _) = setup().await;
         let resp = app
+            .oneshot(Request::builder().uri("/auth").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn machine_request(
+        app: Router,
+        host: &str,
+        method: &str,
+        path: &str,
+        secret: &str,
+    ) -> StatusCode {
+        let credentials = STANDARD.encode(format!("vector:{secret}"));
+        app.oneshot(
+            Request::builder()
+                .uri("/auth")
+                .header("x-forwarded-host", host)
+                .header("x-forwarded-method", method)
+                .header("x-forwarded-uri", path)
+                .header(header::AUTHORIZATION, format!("Basic {credentials}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn machine_credentials_are_limited_to_route_and_method() {
+        let (app, _) = setup().await;
+        assert_eq!(
+            machine_request(
+                app.clone(),
+                "loki.example.com",
+                "POST",
+                "/loki/api/v1/push",
+                "test-machine-secret"
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            machine_request(
+                app.clone(),
+                "loki.example.com",
+                "POST",
+                "/loki/api/v1/push",
+                "wrong"
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            machine_request(
+                app.clone(),
+                "loki.example.com",
+                "GET",
+                "/loki/api/v1/push",
+                "test-machine-secret"
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            machine_request(
+                app.clone(),
+                "loki.example.com",
+                "POST",
+                "/loki/api/v1/query",
+                "test-machine-secret"
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            machine_request(
+                app.clone(),
+                "grafana.example.com",
+                "POST",
+                "/loki/api/v1/push",
+                "test-machine-secret"
+            )
+            .await,
+            StatusCode::FOUND
+        );
+
+        let no_credentials = app
             .oneshot(
                 Request::builder()
                     .uri("/auth")
+                    .header("x-forwarded-host", "loki.example.com")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(no_credentials.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1145,12 +1367,7 @@ mod tests {
             "https://grafana.example.com/dashboard"
         );
 
-        let set_cookie = resp
-            .headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap();
+        let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
         assert!(set_cookie.starts_with("_auth_proxy_session="));
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("Secure"));
@@ -1218,12 +1435,7 @@ mod tests {
         );
 
         // New cookie should be set
-        let set_cookie = resp
-            .headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap();
+        let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
         let cookie_value = set_cookie
             .split(';')
             .next()
@@ -1274,12 +1486,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::FOUND);
 
-        let set_cookie = resp
-            .headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap();
+        let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
         assert!(set_cookie.contains("Max-Age=0"), "cookie should be expired");
 
         let location = resp.headers().get("location").unwrap().to_str().unwrap();

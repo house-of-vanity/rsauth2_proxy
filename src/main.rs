@@ -146,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
         routes: shared_routes.clone(),
         crypto,
         metrics_handle,
+        machine_cache: RwLock::new(std::collections::HashMap::new()),
     });
 
     // Background: watch routes file for changes

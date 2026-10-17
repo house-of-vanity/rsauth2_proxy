@@ -6,7 +6,23 @@ use tokio::sync::RwLock;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RouteConfig {
+    #[serde(default)]
     pub allowed_groups: Vec<String>,
+    #[serde(default = "default_browser_access")]
+    pub browser_access: bool,
+    #[serde(default)]
+    pub machine_access: Option<MachineAccess>,
+}
+
+fn default_browser_access() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MachineAccess {
+    pub client_ids: Vec<String>,
+    pub method: String,
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,18 +51,20 @@ pub async fn watch_routes(path: String, routes: SharedRoutes) {
         // Read through the symlink — k8s ConfigMap updates swap the symlink target,
         // so reading the original path always gives current content.
         match std::fs::read_to_string(&path) {
-            Ok(content) if content != last_content => match serde_yaml::from_str::<RoutesFile>(&content) {
-                Ok(routes_file) => {
-                    let count = routes_file.routes.len();
-                    *routes.write().await = routes_file.routes;
-                    last_content = content;
-                    metrics::gauge!("routes_loaded_total").set(count as f64);
-                    tracing::info!(count, "routes reloaded");
+            Ok(content) if content != last_content => {
+                match serde_yaml::from_str::<RoutesFile>(&content) {
+                    Ok(routes_file) => {
+                        let count = routes_file.routes.len();
+                        *routes.write().await = routes_file.routes;
+                        last_content = content;
+                        metrics::gauge!("routes_loaded_total").set(count as f64);
+                        tracing::info!(count, "routes reloaded");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to parse routes file");
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to parse routes file");
-                }
-            },
+            }
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!(error = %e, "failed to read routes file");
@@ -117,11 +135,7 @@ routes:
     async fn watch_routes_detects_change() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routes.yaml");
-        std::fs::write(
-            &path,
-            "routes:\n  a.example.com:\n    allowed_groups: []\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "routes:\n  a.example.com:\n    allowed_groups: []\n").unwrap();
 
         let initial = load_routes(path.to_str().unwrap()).unwrap();
         let shared: SharedRoutes = Arc::new(RwLock::new(initial));

@@ -29,6 +29,18 @@ struct JwksResponse {
 }
 
 #[derive(Deserialize)]
+struct ClientCredentialsResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: u64,
+}
+
+pub enum ClientCredentialsError {
+    Invalid,
+    Unavailable(anyhow::Error),
+}
+
+#[derive(Deserialize)]
 #[allow(dead_code)]
 pub struct TokenResponse {
     pub id_token: Option<String>,
@@ -59,13 +71,48 @@ pub struct OidcClient {
 }
 
 impl OidcClient {
+    pub async fn check_client_credentials(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> std::result::Result<u64, ClientCredentialsError> {
+        let response = self
+            .http
+            .post(&self.discovery.token_endpoint)
+            .basic_auth(client_id, Some(client_secret))
+            .form(&[("grant_type", "client_credentials")])
+            .send()
+            .await
+            .map_err(|e| ClientCredentialsError::Unavailable(e.into()))?;
+
+        if response.status().is_client_error()
+            && response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            return Err(ClientCredentialsError::Invalid);
+        }
+        let response = response
+            .error_for_status()
+            .map_err(|e| ClientCredentialsError::Unavailable(e.into()))?;
+        let token: ClientCredentialsResponse = response
+            .json()
+            .await
+            .map_err(|e| ClientCredentialsError::Unavailable(e.into()))?;
+        if token.access_token.is_empty() || !token.token_type.eq_ignore_ascii_case("Bearer") {
+            return Err(ClientCredentialsError::Unavailable(anyhow::anyhow!(
+                "unexpected Keycloak token response"
+            )));
+        }
+        Ok(token.expires_in)
+    }
     pub async fn discover(
         issuer: &str,
         client_id: String,
         client_secret: String,
         redirect_uri: String,
     ) -> Result<Self> {
-        let http = Client::new();
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()?;
         let discovery_url = format!(
             "{}/.well-known/openid-configuration",
             issuer.trim_end_matches('/')
@@ -90,10 +137,7 @@ impl OidcClient {
             .await
             .context("failed to parse JWKS")?;
 
-        tracing::info!(
-            keys = jwks.keys.len(),
-            "OIDC discovery complete"
-        );
+        tracing::info!(keys = jwks.keys.len(), "OIDC discovery complete");
 
         Ok(Self {
             http,

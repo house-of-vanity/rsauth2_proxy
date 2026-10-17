@@ -13,7 +13,15 @@ Browser → Traefik → ForwardAuth (/auth) → rsauth2-proxy
 
 Traefik calls `/auth` for every request to a protected service. The proxy checks the encrypted session cookie, verifies group membership against the route config, and returns 200 (allow), 403 (deny), or 302 (login required).
 
-Sessions are stored entirely in an AES-256-GCM encrypted cookie. No server-side state. Any number of replicas work without coordination.
+Machine routes can instead accept HTTP Basic credentials over HTTPS. The proxy
+checks the client ID and secret at Keycloak's `client_credentials` token endpoint
+and caches successful checks for at most five minutes, never beyond the returned
+token lifetime. Invalid credentials return 401, a forbidden route returns 403,
+and a Keycloak outage returns 503 so the client can retry. Machine secrets are
+never stored in the routes file.
+
+Browser sessions are stored entirely in an AES-256-GCM encrypted cookie. Machine
+credential caches are local to each replica; replicas require no coordination.
 
 ## Configuration
 
@@ -52,12 +60,21 @@ routes:
 
   secret.example.com:
     allowed_groups: ["admins"]
+
+  loki.example.com:
+    browser_access: false
+    machine_access:
+      client_ids: ["tsunagi-vector"]
+      method: POST
+      path: /loki/api/v1/push
 ```
 
 Rules:
 - Host in routes, `allowed_groups` empty — any authenticated user is allowed
 - Host in routes, `allowed_groups` set — user must be in at least one listed group
 - Host not in routes — denied (403)
+- `browser_access: false` — no cookie or OIDC redirect on this host
+- `machine_access` — only listed Keycloak clients on the exact method and path
 
 The file is polled every 5 seconds and reloaded on change. This works reliably with Kubernetes ConfigMap volume mounts.
 
